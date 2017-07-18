@@ -4,24 +4,83 @@ provider "aws" {
   region  = "${var.region}"
 }
 
-# S3 Bucket for storing Elastic Beanstalk task definitions
-resource "aws_s3_bucket" "ng_beanstalk_deploys" {
-  bucket = "${var.application_name}-deployments"
+# Beanstalk Application
+resource "aws_elastic_beanstalk_application" "application" {
+  name        = "${var.application_name}"
+  description = "${var.application_description}"
 }
 
-# Elastic Container Repository for Docker images
-resource "aws_ecr_repository" "ng_container_repository" {
-  name = "${var.application_name}"
+# Beanstalk Environment
+resource "aws_elastic_beanstalk_environment" "beanstalk_application_environment" {
+  name                = "${var.application_name}-${var.application_environment}"
+  application         = "${aws_elastic_beanstalk_application.application.name}"
+  solution_stack_name = "64bit Amazon Linux 2017.03 v2.7.1 running Multi-container Docker 17.03.1-ce (Generic)"
+  tier                = "WebServer"
+
+  setting {
+    namespace = "aws:autoscaling:launchconfiguration"
+    name = "InstanceType"
+    value = "t2.micro"
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:environment"
+    name = "EnvironmentType"
+    value = "SingleInstance"
+  }
+
+  setting {
+    namespace = "aws:autoscaling:launchconfiguration"
+    name      = "IamInstanceProfile"
+    value     = "${aws_iam_instance_profile.beanstalk_ec2.name}"
+  }
+
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "VPCId"
+    value     = "${module.vpc.vpc_id}"
+  }
+
+  setting {
+    namespace = "aws:ec2:vpc"
+    name      = "Subnets"
+    value     = "${join(",", module.public_subnet.subnet_ids)}"
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:application:environment"
+    name      = "DATABASE_NAME"
+    value     = "${aws_db_instance.db.name}"
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:application:environment"
+    name      = "DATABASE_HOST"
+    value     = "${aws_db_instance.db.address}"
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:application:environment"
+    name      = "DATABASE_USERNAME"
+    value     = "${aws_db_instance.db.username}"
+  }
+
+  setting {
+    namespace = "aws:elasticbeanstalk:application:environment"
+    name      = "DATABASE_PASSWORD"
+    value     = "${aws_db_instance.db.password}"
+  }
 }
 
 # Beanstalk instance profile
-resource "aws_iam_instance_profile" "ng_beanstalk_ec2" {
-  name  = "ng-beanstalk-ec2-user"
-  roles = ["${aws_iam_role.ng_beanstalk_ec2.name}"]
+resource "aws_iam_instance_profile" "beanstalk_ec2" {
+  name  = "${var.application_name}-beanstalk-ec2-user"
+  role = "${aws_iam_role.beanstalk_ec2.name}"
 }
 
-resource "aws_iam_role" "ng_beanstalk_ec2" {
-  name = "ng-beanstalk-ec2-role"
+resource "aws_iam_role" "beanstalk_ec2" {
+  name = "${var.application_name}-beanstalk-ec2-role"
 
   assume_role_policy = <<EOF
 {
@@ -40,75 +99,122 @@ resource "aws_iam_role" "ng_beanstalk_ec2" {
 EOF
 }
 
-# Beanstalk EC2 Policy
-# Overriding because by default Beanstalk does not have a permission to Read ECR
-resource "aws_iam_role_policy" "ng_beanstalk_ec2_policy" {
-  name = "ng_beanstalk_ec2_policy_with_ECR"
-  role = "${aws_iam_role.ng_beanstalk_ec2.id}"
-
-  policy = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Action": [
-        "cloudwatch:PutMetricData",
-        "ds:CreateComputer",
-        "ds:DescribeDirectories",
-        "ec2:DescribeInstanceStatus",
-        "logs:*",
-        "ssm:*",
-        "ec2messages:*",
-        "ecr:GetAuthorizationToken",
-        "ecr:BatchCheckLayerAvailability",
-        "ecr:GetDownloadUrlForLayer",
-        "ecr:GetRepositoryPolicy",
-        "ecr:DescribeRepositories",
-        "ecr:ListImages",
-        "ecr:DescribeImages",
-        "ecr:BatchGetImage",
-        "s3:*"
-      ],
-      "Effect": "Allow",
-      "Resource": "*"
-    }
-  ]
-}
-EOF
+resource "aws_iam_role_policy_attachment" "eb-web-tier-attach" {
+  role = "${aws_iam_role.beanstalk_ec2.name}"
+  policy_arn = "arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier"
 }
 
-# Beanstalk Application
-resource "aws_elastic_beanstalk_application" "ng_beanstalk_application" {
-  name        = "${var.application_name}"
-  description = "${var.application_description}"
+resource "aws_iam_role_policy_attachment" "eb-ecs-attach" {
+  role = "${aws_iam_role.beanstalk_ec2.name}"
+  policy_arn = "arn:aws:iam::aws:policy/AWSElasticBeanstalkMulticontainerDocker"
 }
 
-# Beanstalk Environment
-resource "aws_elastic_beanstalk_environment" "ng_beanstalk_application_environment" {
-  name                = "${var.application_name}-${var.application_environment}"
-  application         = "${aws_elastic_beanstalk_application.ng_beanstalk_application.name}"
-  solution_stack_name = "64bit Amazon Linux 2016.09 v2.5.1 running Docker 1.12.6"
-  tier                = "WebServer"
+# RDS
+resource "aws_db_instance" "db" {
+  allocated_storage = "${var.rds_allocated_storage}"
+  engine            = "${var.rds_engine_type}"
+  engine_version    = "${var.rds_engine_version}"
+  identifier        = "${var.rds_instance_identifier}"
+  instance_class    = "${var.rds_instance_class}"
 
-  setting {
-    namespace = "aws:autoscaling:launchconfiguration"
-    name      = "InstanceType"
+  vpc_security_group_ids = ["${aws_security_group.db.id}"]
+  db_subnet_group_name   = "${aws_db_subnet_group.db.name}"
 
-    # Todo: As Variable
-    value = "t2.micro"
+  name     = "${var.database_name}"
+  username = "${var.database_user}"
+  password = "${var.database_password}"
+  port     = "${var.database_port}"
+  skip_final_snapshot = true
+
+  storage_type        = "${var.rds_storage_type}"
+
+  tags = {
+    Name = "${var.rds_instance_identifier}"
   }
+}
 
-  setting {
-    namespace = "aws:autoscaling:asg"
-    name      = "MaxSize"
+resource "aws_db_subnet_group" "db" {
+  name        = "${var.rds_instance_identifier}"
+  description = "RDS subnet group"
+  subnet_ids  = ["${module.public_subnet.subnet_ids}"]
 
-    # Todo: As Variable
-    value = "2"
+  tags = {
+    Name = "${var.rds_instance_identifier}"
   }
+}
 
-  setting {
-    namespace = "aws:autoscaling:launchconfiguration"
-    name      = "IamInstanceProfile"
-    value     = "${aws_iam_instance_profile.ng_beanstalk_ec2.name}"
+# Security groups
+resource "aws_security_group" "db" {
+  name        = "${var.rds_instance_identifier}"
+  description = "RDS database access"
+  vpc_id      = "${module.vpc.vpc_id}"
+
+  tags = {
+    Name = "${var.rds_instance_identifier}"
   }
+}
+
+resource "aws_security_group_rule" "allow_internal_db_access" {
+  security_group_id = "${aws_security_group.db.id}"
+
+  type = "ingress"
+
+  from_port   = "${var.database_port}"
+  to_port     = "${var.database_port}"
+  protocol    = "tcp"
+  cidr_blocks = ["${module.vpc.vpc_cidr}"]
+}
+
+resource "aws_security_group_rule" "allow_all_outbound" {
+  security_group_id = "${aws_security_group.db.id}"
+
+  type = "egress"
+
+  from_port   = 0
+  to_port     = 0
+  protocol    = "-1"
+  cidr_blocks = ["0.0.0.0/0"]
+}
+
+# VPC networking
+data "aws_availability_zones" "az" {}
+
+######
+# VPC
+######
+
+module "vpc" {
+  source = "github.com/terraform-community-modules/tf_aws_vpc_only?ref=v1.0.1"
+
+  name                 = "${var.application_name}"
+  cidr                 = "${var.vpc_cidr}"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+}
+
+###################
+# Internet gateway
+###################
+
+module "igw" {
+  source = "github.com/terraform-community-modules/tf_aws_igw?ref=v1.0.0"
+
+  name   = "${var.application_name}"
+  vpc_id = "${module.vpc.vpc_id}"
+}
+
+#################
+# Public subnets
+#################
+
+module "public_subnet" {
+  source = "github.com/terraform-community-modules/tf_aws_public_subnet?ref=v1.0.0"
+
+  name  = "${var.application_name}-public"
+  cidrs = "${var.public_subnets}"
+  azs   = "${data.aws_availability_zones.az.names}"
+
+  vpc_id = "${module.vpc.vpc_id}"
+
+  igw_id = "${module.igw.igw_id}"
 }
